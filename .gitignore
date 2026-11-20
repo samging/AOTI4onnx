@@ -4,26 +4,21 @@ env/
 # Generated artifacts
 __pycache__/
 *.py[cod]
-
 # Model files (can be regenerated; the .onnx originals live elsewhere)
 onnx_aoti/model/*.onnx
-
 # Compiled .pt2 packages
 onnx_aoti/model/*.pt2
 onnx_aoti/tests/artifacts/*.pt2
 onnx_aoti/tests/artifacts/*.onnx
 onnx_aoti/tests/artifacts/*.log
-
 # Kotlin build output
 kotlin/*.jar
 kotlin/libaoti_ffi*
 kotlin/aoti-demo.jar
 kotlin/target/
 kotlin/.gradle/
-
 # Rust build output
 onnx_aoti/rust/target/
-
 # OS files
 .DS_Store
 *.pt
@@ -34,7 +29,6 @@ onnx_aoti/rust/target/
 *.dylib
 *.so
 *.dll
-env/
 .venv/
 rust/target/
 kotlin/build/
