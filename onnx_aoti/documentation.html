@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>onnx_aoti: ONNX to AOTInductor runtime</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2em auto; padding: 0 1em; line-height: 1.5; color: #222; }
+  pre { background: #f4f4f4; padding: 0.8em; overflow-x: auto; }
+  code { background: #f4f4f4; padding: 0 0.2em; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; margin: 0.5em 0; }
+  td, th { border: 1px solid #ccc; padding: 0.3em 0.6em; text-align: left; vertical-align: top; }
+  .note { border-left: 4px solid #d9a400; background: #fff8e1; padding: 0.4em 0.8em; margin: 1em 0; }
+</style>
+</head>
+<body>
+
+<h1>onnx_aoti</h1>
+<p>
+  onnx_aoti turns an ONNX model into an AOTInductor package (<code>.pt2</code>) and runs it
+  natively. Python compiles the model once. After that, Rust and Kotlin load the package through
+  libtorch's AOTInductor runtime, with no Python involved. Kotlin callers can pass an
+  <code>.onnx</code> file directly; the compiled package is cached by content hash.
+</p>
+
+<h2>Contents</h2>
+<ul>
+  <li><a href="#pipeline">How it works</a></li>
+  <li><a href="#layout">Project layout</a></li>
+  <li><a href="#requirements">Requirements</a></li>
+  <li><a href="#compile">1. Compile ONNX to .pt2</a></li>
+  <li><a href="#python-run">2. Run a .pt2 from Python</a></li>
+  <li><a href="#ops">3. Operator coverage and checked conversion</a></li>
+  <li><a href="#rust">4. Rust library</a></li>
+  <li><a href="#kotlin">5. Kotlin/JVM API</a></li>
+  <li><a href="#kotlin-examples">6. Kotlin examples</a></li>
+  <li><a href="#cache">7. The .pt2 cache</a></li>
+  <li><a href="#build">8. Build everything</a></li>
+  <li><a href="#tests">9. Tests</a></li>
+  <li><a href="#troubleshooting">Troubleshooting</a></li>
+  <li><a href="#limits">Limitations</a></li>
+</ul>
+
+<h2 id="pipeline">How it works</h2>
+<pre>
+model.onnx ──(Python, once)──▶ model.pt2 ──(Rust, libtorch C ABI)──▶ inference
+                                   ▲
+                 SHA-256 cache key keeps the compiled file for each
+                 ONNX file + input shape + dtype + compiler sources
+</pre>
+<ul>
+  <li><strong>Python</strong> (<code>onnx_aoti.py</code>): ONNX to PyTorch, <code>torch.export</code>, and
+      <code>aoti_compile_and_package</code>. Adds <code>model_meta.json</code> with the input and output shapes.</li>
+  <li><strong>Rust</strong> (<code>rust/</code>): reads the <code>.pt2</code> zip, extracts the compiled
+      <code>.so</code>, and calls the AOTInductor container API. Exposed as a C ABI (<code>cdylib</code>).</li>
+  <li><strong>Kotlin</strong> (<code>kotlin/</code>): calls the C ABI through the Foreign Function &amp; Memory
+      API (JDK 22+). Provides tensors, sessions, and the cache.</li>
+</ul>
+
+<h2 id="layout">Project layout</h2>
+<pre>
+onnx_aoti/
+├── onnx_aoti.py            compile_onnx_to_pt2(), AOTIModule, CLI
+├── onnx_op_handler.py      checked ONNX to PyTorch conversion with op fallbacks
+├── build.sh                builds Rust, bundles the native library, builds the Kotlin jar
+├── documentation.html      this file
+├── model/                  ONNX and model files
+├── tests/                  Python tests, generated artifacts
+├── rust/
+│   ├── include/aoti_ffi.h  C ABI header
+│   ├── src/lib.rs          AotiModel, OutputView (Rust API)
+│   ├── src/ffi.rs          extern "C" functions
+│   └── examples/infer.rs
+└── kotlin/
+    ├── aoti-demo.jar       built by build.sh (contains the native library)
+    └── src/main/
+        ├── kotlin/         AotiFfm.kt, FloatTensor.kt, InferenceSession.kt,
+        │                   OnnxCache.kt, Main.kt, CacheCheck.kt
+        └── resources/native/&lt;os&gt;-&lt;arch&gt;/   native library copied here by build.sh
+</pre>
+
+<h2 id="requirements">Requirements</h2>
+<table>
+  <tr><th>Component</th><th>Version used</th></tr>
+  <tr><td>Python</td><td>3.14, the repo venv in <code>env/</code></td></tr>
+  <tr><td>PyTorch</td><td>2.15 (includes libtorch and the AOTInductor headers)</td></tr>
+  <tr><td>Rust</td><td>stable, cargo 1.92</td></tr>
+  <tr><td>JDK</td><td>22 or newer (FFM API). Tested with JDK 27.</td></tr>
+  <tr><td>Kotlin</td><td>kotlinc 2.3</td></tr>
+</table>
+<p>
+  <code>LIBTORCH</code> must point to the PyTorch install that contains <code>lib/</code> and <code>include/</code>.
+  In this repo that is <code>/Users/samuel/GitHubRepository/onnx2pt/env/lib/python3.14/site-packages/torch</code>.
+</p>
+
+<h2 id="compile">1. Compile ONNX to .pt2</h2>
+
+<h3>From the command line</h3>
+<pre>
+# Input shape is needed when the ONNX file has dynamic dimensions
+env/bin/python onnx_aoti/onnx_aoti.py \
+    --input model/model_fp16_clean.onnx \
+    --output model/model_compiled.pt2 \
+    --input-shape 1,3,224,224 \
+    --dtype float32
+</pre>
+<table>
+  <tr><th>Flag</th><th>Meaning</th></tr>
+  <tr><td><code>--input</code></td><td>ONNX file (required with <code>--output</code>)</td></tr>
+  <tr><td><code>--output</code></td><td>Output <code>.pt2</code> path</td></tr>
+  <tr><td><code>--input-shape</code></td><td>Comma-separated static shape. Optional if the ONNX file has static dimensions. Dynamic dimensions default to 1.</td></tr>
+  <tr><td><code>--dtype</code></td><td><code>float32</code> (default), <code>float16</code>, or <code>bfloat16</code></td></tr>
+</table>
+<p>With no flags, the script compiles <code>model/model_fp16_clean.onnx</code> to <code>model/model_compiled.pt2</code>.</p>
+
+<h3>What the compile does to the graph</h3>
+<ol>
+  <li><strong>FP16 to FP32 (<code>--dtype float32</code>).</strong> The source model stores weights and some casts in
+      FP16. Converting only the PyTorch module is not enough: in-graph <code>Cast</code> nodes to FLOAT16, FP16
+      initializers, FP16 <code>Constant</code> nodes, and FP16 value types are rewritten to FLOAT32. Without this,
+      tracing fails with <code>Input type (c10::Half) and bias type (float) should be the same</code>.</li>
+  <li><strong>Static shape and constant folding.</strong> When an input shape is given, the ONNX input dimensions are
+      pinned to it and <code>onnxslim</code> folds constants. Shape-driven ops (<code>Shape</code> &rarr;
+      <code>Gather</code> &rarr; <code>Reshape</code>) become constants. The 512&times;512 version of
+      <code>model_fp16_clean.onnx</code> folds from 5,366 nodes to 1,469 in about 8 s. Without folding, the export
+      fails with <code>GuardOnDataDependentSymNode</code> on the reshape inside the graph.</li>
+  <li><strong>Conversion.</strong> The folded graph is converted with <code>convert_checked</code>, exported with
+      <code>torch.export</code>, and compiled with AOTInductor.</li>
+</ol>
+<p>
+  The compiled package is valid only for the shape it was compiled with. To run a different
+  height and width, compile again with that shape.
+</p>
+
+<h3>Checking the compiled package against ONNX Runtime</h3>
+<p>
+  <code>tests/parity_check.py</code> runs the original ONNX file in ONNX Runtime and the compiled package on
+  the same random input in [0, 1). It reports max and mean absolute differences, then checks every element
+  against <code>|pt2 - ort| &le; atol + rtol &middot; |ort|</code>.
+</p>
+<pre>
+env/bin/python onnx_aoti/tests/parity_check.py \
+    --onnx model/model_fp16_clean.onnx \
+    --pt2 model/model_compiled_512.pt2 \
+    --shape 1,3,512,512 \
+    --atol 1e-2 --rtol 1e-2
+</pre>
+<p>
+  The script compares element by element with <code>|pt2 - ort| &le; atol + rtol &middot; |ort|</code>, like
+  <code>np.allclose</code>. It prints max and mean absolute differences before the verdict, and the number of
+  elements that fall outside the tolerance.
+</p>
+<p>
+  The source model is FP16 and the compiled model is FP32, so some difference is expected. Use the measured
+  max and mean differences to decide whether the tolerance is appropriate.
+</p>
+
+<h3>From Python</h3>
+<pre>
+import torch
+from onnx_aoti import compile_onnx_to_pt2
+
+compile_onnx_to_pt2(
+    "model/model_fp16_clean.onnx",
+    "model/model_compiled.pt2",
+    input_shape=[1, 3, 224, 224],
+    dtype=torch.float32,
+)
+</pre>
+<p>
+  The function converts the model with <code>convert_checked</code>, exports it with <code>torch.export</code>,
+  and compiles it with <code>aoti_compile_and_package</code>. It then appends <code>model_meta.json</code>
+  to the zip. The Rust and Kotlin loaders read that file, so they need no shape arguments.
+</p>
+
+<h2 id="python-run">2. Run a .pt2 from Python</h2>
+<pre>
+import torch
+from onnx_aoti import AOTIModule
+
+model = AOTIModule("model/model_compiled.pt2")
+out = model(torch.randn(1, 3, 224, 224))   # must match the compiled input shape
+</pre>
+
+<h2 id="ops">3. Operator coverage and checked conversion</h2>
+<p>
+  <code>onnx_op_handler.convert_checked(onnx_model)</code> is the conversion entry point used by
+  <code>compile_onnx_to_pt2</code>:
+</p>
+<ul>
+  <li><strong>Preflight.</strong> Custom ONNX domains are errors. Data-dependent ops (<code>NonZero</code>,
+      <code>NonMaxSuppression</code>, <code>Unique</code>, <code>Loop</code>, <code>If</code>, <code>Scan</code>)
+      and dynamic input dimensions are warnings. ONNX checker failures are warnings.</li>
+  <li><strong>Constant folding.</strong> Constant shape, axes, and index inputs are baked into the module, so
+      <code>torch.export</code> sees static values. This covers <code>Reshape</code>, <code>Slice</code>,
+      <code>Squeeze</code>, <code>Unsqueeze</code>, the <code>Reduce*</code> family, <code>TopK</code>,
+      <code>CumSum</code>, <code>Expand</code>, <code>Pad</code>, <code>ConstantOfShape</code>,
+      <code>Resize</code>, and <code>OneHot</code>.</li>
+  <li><strong>Error reporting.</strong> Every failing node is collected, and one <code>ONNXConversionError</code>
+      lists them all.</li>
+</ul>
+<p>Register your own converter for an op:</p>
+<pre>
+from onnx_op_handler import register_converter
+
+def my_converter(node, consts, opset):
+    # return fn(*inputs) to handle the node, or None to fall back to onnx2pytorch
+    return lambda x, *_: x * 2
+
+register_converter("MyOp", my_converter)
+</pre>
+<p>
+  The op sweep (<code>tests/test_op_coverage.py</code>) checks 87 single-node ops against onnxruntime. All 87 pass.
+  Ops whose output shape depends on runtime values still fail under AOTInductor.
+</p>
+
+<h2 id="rust">4. Rust library</h2>
+<p>
+  The crate in <code>rust/</code> builds <code>libaoti_ffi.dylib</code> (macOS) or <code>libaoti_ffi.so</code>
+  (Linux) for the C ABI, plus an <code>rlib</code> for Rust callers.
+</p>
+<pre>
+use aoti_ffi::AotiModel;
+
+let model = AotiModel::load("model/model_compiled.pt2", 1)?;  // 1 = concurrent instances
+let outputs = model.run(&input, &[1, 3, 224, 224])?;          // Vec&lt;Tensor&gt;, copies
+model.run_into(&input, &shape, &mut out_buf)?;               // writes into your buffer
+let view = model.run_view(&input, &shape)?;                  // borrows libtorch memory
+</pre>
+<p>Run the Rust example:</p>
+<pre>
+cd onnx_aoti/rust
+LIBTORCH=/path/to/torch cargo run --release --example infer -- ../tests/artifacts/small_net.pt2
+</pre>
+
+<h3>C ABI (<code>rust/include/aoti_ffi.h</code>)</h3>
+<table>
+  <tr><th>Function</th><th>Purpose</th></tr>
+  <tr><td><code>aoti_load(path, num_runners)</code></td><td>Load a package. Returns NULL on error.</td></tr>
+  <tr><td><code>aoti_free(model)</code></td><td>Release the handle. Calls still running keep the model alive.</td></tr>
+  <tr><td><code>aoti_run_into(model, in, in_len, shape, ndim, out, out_len)</code></td><td>Output into a caller buffer.</td></tr>
+  <tr><td><code>aoti_run_view(model, in, in_len, shape, ndim, &amp;out)</code></td><td>Output as a view. Release with <code>aoti_result_free</code>.</td></tr>
+  <tr><td><code>aoti_result_free(raw_handle)</code></td><td>Release a view.</td></tr>
+  <tr><td><code>aoti_last_error(buf, cap)</code></td><td>Copy this thread's last error message.</td></tr>
+</table>
+<p>Functions return 0 on success and -1 on error. The error message is per thread.</p>
+
+<h2 id="kotlin">5. Kotlin/JVM API</h2>
+<p>All types are in the default package of <code>kotlin/aoti-demo.jar</code>.</p>
+
+<table>
+  <tr><th>Type or member</th><th>Purpose</th></tr>
+  <tr><td><code>AotiLibrary.default()</code></td><td>Loads the native library bundled in the jar. Override with <code>-Daoti.ffi.lib=...</code> or <code>AOTI_FFI_LIB</code>.</td></tr>
+  <tr><td><code>AotiLibrary.load(path, numRunners = 1)</code></td><td>Loads a <code>.pt2</code> file and reads its shapes. The path can be absolute, relative to the working directory, or absolute to a parent of it.</td></tr>
+  <tr><td><code>AotiLibrary.loadOnnx(onnxPath, inputShape, dtype, numRunners, cacheDir, pythonBin, compilerScript)</code></td><td>Loads an ONNX file through the cache. Compiles it on a cache miss. See <a href="#cache">the cache section</a>.</td></tr>
+  <tr><td><code>AotiDtype</code></td><td><code>FLOAT32</code>, <code>FLOAT16</code>, <code>BFLOAT16</code></td></tr>
+  <tr><td><code>Model.inputShape</code>, <code>outputShape</code></td><td>Shapes from <code>model_meta.json</code> (<code>LongArray</code>).</td></tr>
+  <tr><td><code>Model.inputNumel</code>, <code>outputNumel</code></td><td>Element counts.</td></tr>
+  <tr><td><code>Model.allocateInput()</code>, <code>allocateOutput()</code></td><td>New zeroed <code>FloatTensor</code> with the model's shape.</td></tr>
+  <tr><td><code>Model.predict(input)</code></td><td>Runs the model and returns a new <code>FloatTensor</code>. One copy of the output.</td></tr>
+  <tr><td><code>Model.newSession()</code></td><td>Returns an <code>InferenceSession</code> with pre-allocated input and output.</td></tr>
+  <tr><td><code>FloatTensor</code></td><td>Native float32 tensor that owns its memory. Members: <code>shape</code>, <code>numel</code>, <code>copyFrom(FloatArray)</code>, <code>toFloatArray()</code>, <code>get(i)</code>, <code>set(i, v)</code>, <code>close()</code>. Factories: <code>FloatTensor.zeros(vararg shape)</code>, <code>FloatTensor.of(data, vararg shape)</code>.</td></tr>
+  <tr><td><code>InferenceSession</code></td><td><code>input</code>, <code>output</code> (both <code>FloatTensor</code>), <code>run()</code>, <code>close()</code>. Closing a session does not close the model.</td></tr>
+  <tr><td><code>AotiException</code></td><td>Thrown for load, run, and compile errors. Compile errors include the Python output.</td></tr>
+</table>
+
+<h3>Concurrency and lifetime</h3>
+<ul>
+  <li><code>Model.predict</code> and session <code>run()</code> can be called from several threads at once.
+      <code>numRunners</code> sets how many can run in parallel. Use one <code>InferenceSession</code> per thread.
+      A single model without a session is safe to call from many threads if you tolerate allocation, which each
+      call pays for.</li>
+  <li><code>Model.close()</code> waits for calls in progress to finish. Calls after <code>close()</code> throw
+      <code>IllegalStateException</code>.</li>
+  <li><code>FloatTensor</code> uses a shared arena, so it can be passed between threads. A tensor must be closed
+      once. Using it after <code>close()</code> throws <code>IllegalStateException</code>.</li>
+</ul>
+
+<h2 id="kotlin-examples">6. Kotlin examples</h2>
+<p>
+  Each example assumes <code>lib</code> is an <code>AotiLibrary</code> and <code>model</code> is a
+  <code>Model</code>. The imports are <code>java.nio.file.Path</code> and the classes above.
+</p>
+
+<h3>6.1 Load from an ONNX file</h3>
+<pre>
+import java.nio.file.Path
+
+val lib = AotiLibrary.default()
+
+// First call compiles the ONNX file with Python and caches the result.
+// Later calls, including in new processes, load the cached .pt2 directly.
+lib.loadOnnx(
+    onnxPath = Path.of("model/model_fp16_clean.onnx"),
+    inputShape = longArrayOf(1, 3, 224, 224),   // required when the ONNX input has dynamic dimensions
+    dtype = AotiDtype.FLOAT32,
+    numRunners = 4,
+).use { model ->
+    println("input=${model.inputShape.toList()} output=${model.outputShape.toList()}")
+}
+</pre>
+
+<h3>6.2 Load a compiled .pt2 directly</h3>
+<pre>
+lib.load(Path.of("model/model_compiled.pt2"), numRunners = 2).use { model ->
+    println("expects ${model.inputNumel} input values")
+}
+</pre>
+
+<h3>6.3 One call with predict</h3>
+<pre>
+lib.loadOnnx(Path.of("tests/artifacts/small_net.onnx")).use { model ->
+    val data = FloatArray(model.inputNumel.toInt()) { i -> kotlin.math.sin(i * 0.01).toFloat() }
+
+    FloatTensor.of(data, *model.inputShape).use { input ->
+        model.predict(input).use { output ->
+            println("shape=${output.shape.toList()} values=${output.toFloatArray().toList()}")
+        }
+    }
+}
+</pre>
+<p>
+  <code>predict</code> checks that the input shape matches the model. It allocates the output and copies it once.
+</p>
+
+<h3>6.4 Hot loop with a session</h3>
+<pre>
+lib.loadOnnx(Path.of("model/model_fp16_clean.onnx"), inputShape = longArrayOf(1, 3, 224, 224)).use { model ->
+    val frame = FloatArray(model.inputNumel.toInt()) { 0.1f }
+
+    model.newSession().use { session ->
+        session.input.copyFrom(frame)        // reuse the same input buffer
+        repeat(1000) {
+            session.run()                    // writes into session.output, no allocation
+        }
+        println("first values: ${session.output.toFloatArray().take(5)}")
+    }
+}
+</pre>
+
+<h3>6.5 Several threads</h3>
+<pre>
+import kotlin.concurrent.thread
+
+lib.loadOnnx(Path.of("tests/artifacts/small_net.onnx"), numRunners = 4).use { model ->
+    val workers = (1..4).map { id ->
+        thread {
+            model.newSession().use { session ->       // one session per thread
+                session.input.copyFrom(FloatArray(model.inputNumel.toInt()) { id * 0.1f })
+                repeat(200) { session.run() }
+            }
+        }
+    }
+    workers.forEach { it.join() }
+}
+</pre>
+
+<h3>6.6 Write your own inputs and read outputs</h3>
+<pre>
+lib.load(Path.of("model/model_compiled.pt2")).use { model ->
+    model.allocateInput().use { input ->
+        input[0L] = 0.5f                      // element access by flat index
+        input[1L] = -0.25f
+        model.predict(input).use { out ->
+            val first = out[0L]
+            println("first output value: $first")
+        }
+    }
+}
+</pre>
+
+<h3>6.7 Handle errors</h3>
+<pre>
+try {
+    lib.loadOnnx(Path.of("bad.onnx"))
+} catch (e: AotiException) {
+    // Compile errors include the Python traceback
+    println(e.message)
+}
+
+try {
+    FloatTensor.zeros(2, 2).use { it.copyFrom(FloatArray(3)) }   // wrong size
+} catch (e: IllegalArgumentException) {
+    println(e.message)
+}
+</pre>
+
+<h3>6.8 Measured latency</h3>
+<p>
+  Measured on this machine (macOS, arm64) with the Kotlin demo <code>MainKt</code>. Each <code>predict</code> number
+  is the mean of 500 calls after 20 warm-up calls. Each session number is 1000 calls to <code>session.run()</code>.
+</p>
+<table>
+  <tr><th>Model</th><th>Input</th><th>predict() per call</th><th>session.run() per call</th><th>Cold compile</th><th>Warm load</th></tr>
+  <tr><td><code>small_net.onnx</code> (test CNN)</td><td>1,3,8,8</td><td>104&ndash;117 &micro;s</td><td>38&ndash;44 &micro;s</td><td>8.3 s</td><td>0.28&ndash;0.68 s</td></tr>
+  <tr><td><code>model_fp16_clean.onnx</code> (FP32 compile)</td><td>1,3,512,512</td><td colspan="5"><strong>failed in export</strong></td></tr>
+  <tr><td><code>model_fp16_clean.onnx</code> via ONNX Runtime parity</td><td>1,3,512,512</td><td colspan="5">not run: no compiled package yet</td></tr></table>
+<p>
+  The 512&times;512 export fails. After folding, the graph has 21 <code>Shape</code> ops and 2 <code>Cast</code>
+  nodes, so the static folding is not complete. <code>torch.export</code> raises a data-dependent guard on a
+  <code>Resize</code>. The compiler output is in <code>/tmp/compile512.log</code> and <code>/tmp/x.pt2.log</code>.
+</p>
+<h3>Measuring predict()</h3>
+<p>
+  <code>Main.kt</code> now prints the average time of <code>model.predict(input).close()</code> over 500 calls
+  after 20 warm-up calls. It uses the static zero-copy path, so it includes one output copy and one allocation.
+  To measure only inference, reuse a session.
+</p>
+</table>
+<p>
+  <code>DraftExport</code> or <code>TORCH_LOGS=dynamic</code> can help identify which nodes stay dynamic. Or set
+  <code>resize_resolved_sizes</code> in the ONNX model with the target sizes.
+</p>
+</table>
+<p>
+  <code>predict</code> allocates the output and copies it once. <code>session.run()</code> writes into the pre-allocated
+  output, so it is faster. The warm load includes first-call JVM and FFM setup, which is why it is larger than the
+  predict time.
+</p>
+
+</table>
+<h2 id="cache">7. The .pt2 cache</h2>
+<p>
+  <code>loadOnnx</code> keys the cache by a SHA-256 hash of:
+</p>
+<ul>
+  <li>the <code>.onnx</code> file bytes, plus the <code>.onnx.data</code> external-weights file if present</li>
+  <li>the input shape (<code>auto</code> if none is given)</li>
+  <li>the dtype</li>
+  <li>the Python compiler sources (<code>*.py</code> next to the compiler script)</li>
+</ul>
+<p>Cache file: <code>&lt;cacheDir&gt;/&lt;hash&gt;.pt2</code>. The defaults are:</p>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Environment variable</th></tr>
+  <tr><td>Cache directory</td><td><code>~/.cache/onnx_aoti</code></td><td><code>AOTI_CACHE_DIR</code></td></tr>
+  <tr><td>Python</td><td><code>env/bin/python</code>, searched upward from the working directory, else <code>python3</code></td><td><code>AOTI_PYTHON</code></td></tr>
+  <tr><td>Compiler script</td><td><code>onnx_aoti/onnx_aoti.py</code>, searched upward</td><td><code>AOTI_COMPILER_SCRIPT</code></td></tr>
+</table>
+<p>
+  Hashing a large file is slow, so the content hash is stored in <code>&lt;cacheDir&gt;/index.tsv</code>, keyed by
+  canonical path, file size, and modification time (for the <code>.onnx</code> file and its <code>.onnx.data</code>
+  companion if present). When those match, the file is not read again. On the 145 MB
+  <code>model_fp16_clean.onnx</code>, the first hash takes about 190 ms and an index hit about 1.4 ms.
+</p>
+<ul>
+  <li><strong>Cache hit:</strong> Python is not started. The package loads directly.</li>
+  <li><strong>Cache miss:</strong> Python compiles the file into a temp file, then renames it into the cache.
+      A compile takes several seconds (about 8 s for the test model). Concurrent callers wait for the same compile.</li>
+  <li><strong>Errors:</strong> a failed compile raises <code>AotiException</code> with the Python traceback.
+      The compile times out after 30 minutes.</li>
+</ul>
+<p>
+  Pre-warm the cache in CI and ship the <code>.pt2</code> files with your application, so production machines
+  don't need Python unless they see a new model.
+</p>
+
+<h2 id="build">8. Build everything</h2>
+<pre>
+cd onnx_aoti
+LIBTORCH=/Users/samuel/GitHubRepository/onnx2pt/env/lib/python3.14/site-packages/torch ./build.sh
+</pre>
+<p>
+  <code>build.sh</code> builds the Rust library in release mode, copies it to
+  <code>kotlin/src/main/resources/native/&lt;os&gt;-&lt;arch&gt;/</code>, compiles the Kotlin sources, and
+  packages <code>kotlin/aoti-demo.jar</code> with the library inside.
+</p>
+
+<h3>Run the demos</h3>
+<pre>
+cd onnx_aoti
+java --enable-native-access=ALL-UNNAMED -cp kotlin/aoti-demo.jar MainKt tests/artifacts/small_net.onnx
+java --enable-native-access=ALL-UNNAMED -cp kotlin/aoti-demo.jar MainKt tests/artifacts/small_net.onnx 1,3,8,8
+java --enable-native-access=ALL-UNNAMED -cp kotlin/aoti-demo.jar CacheCheckKt tests/artifacts/small_net.onnx
+java --enable-native-access=ALL-UNNAMED -cp kotlin/aoti-demo.jar CacheCheckKt model/model_fp16_clean.onnx --hash-only
+java --enable-native-access=ALL-UNNAMED -cp kotlin/aoti-demo.jar CacheCheckKt model/model_fp16_clean.onnx 1,3,512,512
+</pre>
+<p>
+  The first <code>MainKt</code> run compiles the model. The second run loads the cached result. Pass a shape as the
+  second argument when the ONNX file has dynamic dimensions. <code>--enable-native-access=ALL-UNNAMED</code>
+  silences a warning from the FFM API. The program still runs without it.
+</p>
+
+<h2 id="tests">9. Tests</h2>
+<table>
+  <tr><th>Command</th><th>What it checks</th></tr>
+  <tr><td><code>env/bin/python onnx_aoti/tests/test_onnx_aoti.py</code></td><td>Compile a small CNN and run it through AOTInductor. Compare with PyTorch.</td></tr>
+  <tr><td><code>env/bin/python onnx_aoti/tests/test_op_coverage.py</code></td><td>87 ONNX ops: convert, run, export, compare with onnxruntime.</td></tr>
+  <tr><td><code>env/bin/python onnx_aoti/tests/test_op_handler.py</code></td><td>Error reporting, custom domains, registered converters, end-to-end AOTI.</td></tr>
+  <tr><td><code>cargo run --release --example infer -- tests/artifacts/small_net.pt2</code></td><td>Rust API on the test model.</td></tr>
+  <tr><td><code>java -cp kotlin/aoti-demo.jar MainKt tests/artifacts/small_net.onnx</code></td><td>Cache load, predict, and hot loop.</td></tr>
+  <tr><td><code>java -cp kotlin/aoti-demo.jar CacheCheckKt tests/artifacts/small_net.onnx</code></td><td>Four concurrent cold loads compile once. Warm load skips Python. Edited files get a new key. Broken ONNX reports the error.</td></tr>
+  <tr><td><code>java -cp kotlin/aoti-demo.jar CacheCheckKt model/model_fp16_clean.onnx --hash-only</code></td><td>Hashes the 145 MB model once, then reports the index-hit cost. Note: it also runs the four-thread cold/warm checks first, so expect the compile to run too unless the cache is warm.</td></tr>
+</table>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause and fix</th></tr>
+  <tr><td><code>model_meta.json missing</code></td><td>The <code>.pt2</code> was built before the metadata change. Recompile it.</td></tr>
+  <tr><td><code>native library not bundled</code></td><td>Run <code>build.sh</code>, or set <code>-Daoti.ffi.lib=/path/to/libaoti_ffi.dylib</code>.</td></tr>
+  <tr><td><code>could not start Python</code></td><td>Set <code>AOTI_PYTHON</code> to the venv Python.</td></tr>
+  <tr><td><code>Compiler script not found</code></td><td>Set <code>AOTI_COMPILER_SCRIPT</code> to <code>onnx_aoti.py</code>.</td></tr>
+  <tr><td><code>missing symbol aoti_torch_*</code></td><td>libtorch is not loaded. Check <code>LIBTORCH</code> at build time and that the library has the rpath.</td></tr>
+  <tr><td>Stale results after editing the compiler</td><td>Not expected: the compiler sources are part of the key. Clear the cache directory after upgrading PyTorch, since the PyTorch version is not in the key.</td></tr>
+  <tr><td>Shape error from <code>predict</code> or <code>runInto</code></td><td>The tensor shape must equal <code>model.inputShape</code>. Check the compile-time shape.</td></tr>
+</table>
+
+<h2 id="limits">Limitations</h2>
+<ul>
+  <li>Only single-output models are supported in Rust and Kotlin.</li>
+  <li>Compiled packages are static-shape. Dynamic dimensions default to 1 unless you pass a shape.</li>
+  <li>The Rust library depends on libtorch's internal C ABI (<code>AOTInductorModelContainer*</code>,
+      <code>aoti_torch_*</code>). Recheck it after each PyTorch upgrade.</li>
+  <li>The PyTorch and onnxslim versions are not part of the cache key. Clear the cache directory after upgrading either.</li>
+  <li>A compiled package is specialized to its input shape. Changing height or width needs a new compile, which is a
+      separate cache entry.</li>
+  <li>The index trusts size and modification time. A file rewritten with the same size and an unchanged
+      modification time (for example <code>cp -p</code> of different content) keeps its old hash. Delete
+      <code>index.tsv</code> to force a rehash.</li>
+  <li>A warm load of the small test model takes 220–460 ms on this machine, including first-call JVM and FFM setup.</li>
+  <li><code>predict</code> copies the output once. <code>run_into</code> and sessions avoid that copy.</li>
+  <li>The bundled library links libtorch by absolute path. Distributing it needs libtorch bundled too, and the jar
+      only contains the platform that built it (<code>macos-aarch64</code> here).</li>
+  <li>Ops that produce output shapes from runtime values (<code>NonZero</code>, <code>Unique</code>,
+      <code>NonMaxSuppression</code>, <code>Loop</code>, <code>If</code>) are not supported.</li>
+  <li><code>float16</code> and <code>bfloat16</code> compilation are not tested.</li>
+  <li>Error paths for wrong buffer sizes, non-float32 outputs, and multi-output models are not tested.</li>
+</ul>
+
+</body>
+</html>
