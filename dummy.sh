@@ -1,17 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'
+    C_BLUE=$'\033[1;34m'
+    C_GREEN=$'\033[0;32m'
+    C_YELLOW=$'\033[0;33m'
+    C_RED=$'\033[0;31m'
+else
+    C_RESET='' C_BLUE='' C_GREEN='' C_YELLOW='' C_RED=''
+fi
+
 writeLog() {
     local level="$1"
     shift
-    local ts project
+    local ts project color=""
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     project="${PROJECT:-${PWD##*/}}"
 
+    case "$level" in
+        OK)    color="$C_GREEN" ;;
+        INFO)  color="$C_BLUE" ;;
+        WARN)  color="$C_YELLOW" ;;
+        ERROR) color="$C_RED" ;;
+    esac
+
+    # Colored output in terminal (stderr)
     if [[ "$level" == "ERROR" ]]; then
-        printf '[ERROR] [%s] %s (dir: %s)\n' "$project" "$*" "$PWD" >&2
-        printf '%s [ERROR] [%s] %s (dir: %s)\n' "$ts" "$project" "$*" "$PWD" >> "$LOG_FILE"
+        printf '%s%-7s%s [%s] %s (dir: %s)\n' "$color" "[$level]" "$C_RESET" "$project" "$*" "$PWD" >&2
+        printf '%s %-7s [%s] %s (dir: %s)\n' "$ts" "[$level]" "$project" "$*" "$PWD" >> "$LOG_FILE"
     else
+        printf '%s%-7s%s [%s] %s\n' "$color" "[$level]" "$C_RESET" "$project" "$*" >&2
         printf '%s %-7s [%s] %s\n' "$ts" "[$level]" "$project" "$*" >> "$LOG_FILE"
     fi
 }
