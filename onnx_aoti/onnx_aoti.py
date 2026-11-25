@@ -129,6 +129,7 @@ def compile_onnx_to_pt2(
     output_pt2_path: str | Path,
     input_shape: list[int] | None = None,
     dtype: torch.dtype = torch.float32,
+    program_path: str | Path | None = None,
 ) -> Path:
     if input_shape is None:
         inp = onnx.load(str(onnx_path), load_external_data=False).graph.input[0]
@@ -142,6 +143,8 @@ def compile_onnx_to_pt2(
 
     with torch.no_grad():
         exported = torch.export.export(torch_model, example_inputs)
+        if program_path is not None:
+            torch.export.save(exported, str(program_path))
         torch._inductor.aoti_compile_and_package(
             exported,
             package_path=str(output_pt2_path),
@@ -200,6 +203,8 @@ if __name__ == "__main__":
                         help="Comma-separated static input shape, e.g. '1,3,224,224'")
     parser.add_argument("--dtype", type=str, default="float32", choices=list(_DTYPE_MAP),
                         help="Compilation dtype (default: float32)")
+    parser.add_argument("--program", type=Path, default=None,
+                        help="Also save the torch.export ExportedProgram here, before it is compiled (torch.export.save)")
     args = parser.parse_args()
 
     if args.input and args.output:
@@ -208,6 +213,7 @@ if __name__ == "__main__":
             output_pt2_path=args.output,
             input_shape=_parse_shape(args.input_shape),
             dtype=_DTYPE_MAP[args.dtype],
+            program_path=args.program,
         )
     elif args.input or args.output:
         parser.error("Both --input and --output must be provided together.")
